@@ -1,7 +1,6 @@
 
 
-
-# CAPL工具库 <small>0.1</small>
+# CAPL工具库 <small>2.0</small>
 
 > 基于osektp.dll封装诊断相关函数
 
