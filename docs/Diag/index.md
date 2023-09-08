@@ -1,24 +1,54 @@
 # 诊断发送和接收相关
 ##  <font size=2>`Struct`</font> 数据结构<!-- {docsify-ignore} -->
 
-> 几乎所有诊断功能都是在操作这个结构体，它是核心中的核心，你也可以直接从这个结构体中拿数据或者修改数据
+> 几乎所有诊断功能都是在操作这个结构体，它是核心中的核心，你也可以直接从这个结构体中拿数据或者修改数据。详情请看 [struct/DiagStruct.can](https://github.com/ac1303/capl/blob/main/V2.0/struct/DiagStruct.can)
 
 ```c
+
+  enum DiagDir{
+    TxMsg = 0,
+    RxMsg = 1
+  };
+  enum RespType{
+    Answer=1,
+    diagTimeoutButAnswered=2,
+    Sending=-1,
+    SendFail=-2,
+    WaitAnswer=-3,
+    NoAnswer=-4,
+    Pending=-5,   // 0x78
+    FlowControl=-6,
+    OverFlow=-7,
+    diagTimeout=-8
+  };
+  // DiagMsg 用来存储发送和接收的数据
+  struct DiagMsg{
+    enum DiagDir dir;
+    int dateLen;
+    char date[61];
+  } diagMsg;
+  // Diag 存储连接的信息
   struct Diag{
     long handle; // 句柄
-    int diagReq; // // 0 无应答 ， 1有应答， 2流控帧，3 NRC 0x78
-    dword setDelay; //延迟发送时间
+    enum RespType respInd; 
+    
+    long PendingCount;// NRC 0x78 等待次数
+    long CFCount; // 连续帧计数
+    long FCCount; // 流控帧计数
+    dword delayTime; //延迟发送时间
+
     word p2server;
     word p2_server;// p2*server
-    word timeout;
-    
+    word timeout;  // 停止等待响应时间，超过改时间判定为诊断无应答
+
     long reqLength;// 发送的诊断服务数据
     byte reqData[4096];
-    word respLength; // 诊断响应的实际长度
+    long respLength; // 诊断响应的实际长度
     byte respData[4096]; 
-  }Diag;
-  msTimer tSendAbortTimer_ms; // 停止发送计时器
-  msTimer P2Timeout; //计算p2server和p2*server超时
+  };
+  struct Diag _diagMap[long];
+  struct DiagMsg _diagMsgMap[long,20];
+  long _msgMapIndex = 0;
 ```
 
 ## 发送过程<!-- {docsify-ignore} -->
@@ -27,32 +57,34 @@
 
 ```c
 void sendDiag(long diagHandle,byte data[]){
-  sendDiag(diagHandle, data, elCount(data));
+  sendDiag(diagHandle,data,elcount(data));
 }
-void sendDiag(long diagHandle,byte data[],int length){
-  Diag.diagReq = 0;
-  Diag.reqLength = length;
-  memcpy(Diag.reqData,data,length);
+void sendDiag(long diagHandle,byte data[],long length){
+  long count,CFCount,FCCount;
+  count = 0;
+  setDiagReqData(diagHandle,data,length);
   CanTpSendData(diagHandle, data, length);
-  setTimer(P2Timeout,Diag.p2server);
-  waitDiagResp();
+  setDiagRespInd(diagHandle,Sending);
+  while(getDiagRespInd(diagHandle) == Sending){
+    testWaitForTimeout(1);
+  }
+  if(getDiagRespInd(diagHandle) == SendFail){
+    return;
+  }
+  _waitResponse(diagHandle);
+//  logging(debug,"sendDiag：诊断发送完成，当前状态是",getDiagRespInd(diagHandle));
 }
 ```
 
 其他的发送函数可以根据不同的需求进行封装，例如：
 
 ```c
-// 22服务
-void sendDiag22xxxx(long diagHandle,word did){
-  byte q22[3] = {0x22};
-  q22[1] = did >> 8;
-  q22[2] = did & 0xFF;
-  sendDiag(diagHandle,q22);
+int sendDiag36(long diagHandle,byte buffer[],long bufferlen,long buffertop){
+  return sendDiag36(diagHandle,buffer,bufferlen,buffertop,130);
 }
-// 36服务
 int sendDiag36(long diagHandle,byte buffer[],long bufferlen,long buffertop,dword segmentSize){
-  int i = 1,len;
-  byte q36[4096] = {0x36};
+  int i = 1;
+  byte q36[4096] = {0x36},respData[4096];
   i = 1;
   do{
     q36[1] = i;
@@ -70,11 +102,24 @@ int sendDiag36(long diagHandle,byte buffer[],long bufferlen,long buffertop,dword
     }else{
       i++;
     }
-    if(Diag.reqData[0] + 0x40 != Diag.respData[0]){
+    if(respData[0] != 0x76){
+      logging(warning,LOG_MESSAGE,"36服务收到否定应答");
       return 0;
     }
   }while(buffertop < bufferlen);
   return 1;
+}
+
+void sendDiag1001(long diagHandle){
+  byte q1001[2]={0x10,0x01};
+  sendDiag(diagHandle,q1001);
+  testWaitForTimeout(500);
+}
+void sendDiag22xxxx(long diagHandle,word did){
+  byte q22[3] = {0x22};
+  q22[1] = did >> 8;
+  q22[2] = did & 0xFF;
+  sendDiag(diagHandle,q22);
 }
 ```
 
@@ -101,20 +146,17 @@ int sendDiag36(long diagHandle,byte buffer[],long bufferlen,long buffertop,dword
 CanTp_ReceptionInd是官方回调函数，当诊断出现应答时会调用这个函数，data为响应数据
 
 ```
-CanTp_ReceptionInd(long handle, byte data[])
+void CanTp_ReceptionInd( long connHandle, byte data[])
 {
-  int i;
-  cancelTimer(P2Timeout); // 收到了应答，所以取消定时，如果该定时器被执行了，说明出现了超时
-  i=elCount(data);
   if(data[0]==0x7f && data[2]==0x78){
-    Diag.respLength = 0;
-    Diag.diagReq = 3;  // 表示当前处于NRC 0x78状态
-    setTimer(P2Timeout,Diag.p2_server); // 重新定时
+    setDiagPendingCount(connHandle,getDiagPendingCount(connHandle)+1);
+    setDiagRespInd(connHandle,Pending);
     return;
   }
-  memcpy(Diag.respData,data,i); //将获得的响应数据拷贝到Diag.respData
-  Diag.respLength = i;
-  Diag.diagReq = 1;// 将接收标志位置一，表示已经收到了响应
+  setDiagRespData(connHandle,data,elcount(data));
+  setDiagRespInd(connHandle,Answer);
+  logging(debug,LOG_MESSAGE, "收到应答报文， connHandle = ",connHandle);
+  logging(debug,LOG_MESSAGE,"应答：",data,elCount(data));
 }
 ```
 
@@ -123,27 +165,64 @@ CanTp_ReceptionInd(long handle, byte data[])
 waitDiagResp函数的主要功能是等待，等待CanTp_ReceptionInd将应答标志位置一，若是在规定时间内应答标志位置没有置一，说明出现了超时，然后做一些善后处理
 
 ```
-void waitDiagResp(){ // 总感觉这个函数会爆出来一个大坑。。。乱糟糟的
-  word count;
-  count = 0;
-  while(Diag.diagReq == 0){ //未响应
-    if(count == Diag.timeout){ 
-      Diag.respLength = 0;
-      Diag.setDelay = 0;
-      break;
+
+int _waitResponse(long diagHandle){
+  return _waitResponse(diagHandle,0);
+}
+int _waitResponse(long diagHandle,long count){
+  long PendingCount;
+  long PendingTime;
+  while(getDiagRespInd(diagHandle) == WaitAnswer){
+    if(count >= getDiagP2server(diagHandle)){
+      setDiagRespInd(diagHandle,diagTimeout);
+      return _waitResponse(diagHandle,count);
     }
-    testWaitForTimeout(1);
     count++;
-  };
-  count = 0;
-  // TODO 这里得加个跳出死循环的条件
-  while(Diag.diagReq == 3){ // 收到 NRC 0x78
     testWaitForTimeout(1);
+  }
+  while(getDiagRespInd(diagHandle) == Pending){
+    if(getDiagPendingCount(diagHandle) != PendingCount){
+      PendingCount = getDiagPendingCount(diagHandle);
+      PendingTime = 0;
+    }
+    if(PendingTime >= getDiagP2server(diagHandle)){
+      write(" NRC 0x78 诊断响应超时!!!");
+      setDiagRespInd(diagHandle,NoAnswer);
+      return diagTimeout;
+    }
+    PendingTime++;
+    testWaitForTimeout(1);
+  }
+  while(getDiagRespInd(diagHandle) == FlowControl){
+    // 暂时不做处理
+    write("_waitResponse：收到流控帧，但是没有做相关处理，我认为不应该执行到这里，");
+  }
+  // 处理timeout
+  while(getDiagRespInd(diagHandle) == diagTimeout){
+    if(count >= getDiagTimeout(diagHandle)){
+      setDiagRespInd(diagHandle,NoAnswer);
+      logging(warning,LOG_MESSAGE,"诊断无应答！！！");
+      return NoAnswer;
+    }
     count++;
-  };
-//  这里不再进行拷贝，响应数据和长度直接由CanTp_ReceptionInd回调函数拷贝到Diag.respData
-  Diag.diagReq = 0;
+    testWaitForTimeout(1);
+  }
+  if(getDiagRespInd(diagHandle) == OverFlow){
+    return OverFlow;
+  }
+  if(count <= getDiagP2server(diagHandle)){
+    logging(debug,LOG_MESSAGE,"诊断响应成功，响应时间为 ",count," ms");
+    setDiagRespInd(diagHandle,Answer);
+    return diagTimeoutButAnswered;
+  }else{
+    logging(error,LOG_MESSAGE,"诊断响应超时，响应时间为 ",count ," ms");
+    setDiagRespInd(diagHandle,diagTimeoutButAnswered);
+    return diagTimeoutButAnswered;
+  }
+  write("_waitResponse出现一个错误，等待响应时间为 count = %d，当前状态为 %d",count,getDiagRespInd(diagHandle));
+  return NoAnswer;
 }
 ```
 
-当sendDiag发送诊断响应后，会调用waitDiagResp进行等待，有两种方式可以结束waitDiagResp的等待，一是CanTp_ReceptionInd收到应答，二是等待时间大于等待chao'shi
+当sendDiag发送诊断响应后，会调用waitDiagResp进行等待
+
