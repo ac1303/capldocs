@@ -10,6 +10,6 @@
 - 提高代码重复利用率
 - 快速开发
 
-[GitHub](https://github.com/docsifyjs/docsify/)
-[Download](https://github.com/docsifyjs/docsify/)
+[GitHub](https://github.com/ac1303/capldocs)
+[Download](https://github.com/ac1303/capl)
 [Get Started](/README)
